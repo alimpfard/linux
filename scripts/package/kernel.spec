@@ -182,9 +182,6 @@ rm -f debugfiles.list debuglinks.list debugsourcefiles.list debugsources.list \
 %endif
 
 %post
-if [ -x /usr/bin/kernel-install ]; then
-	/usr/bin/kernel-install add %{KERNELRELEASE} /lib/modules/%{KERNELRELEASE}/vmlinuz
-fi
 for file in vmlinuz System.map config; do
 	if ! cmp --silent "/lib/modules/%{KERNELRELEASE}/${file}" "/boot/${file}-%{KERNELRELEASE}"; then
 		cp "/lib/modules/%{KERNELRELEASE}/${file}" "/boot/${file}-%{KERNELRELEASE}"
@@ -197,6 +194,9 @@ if [ -d "/lib/modules/%{KERNELRELEASE}/dtb" ] && \
 fi
 if [ ! -e "/lib/modules/%{KERNELRELEASE}/modules.dep" ]; then
 	/usr/sbin/depmod %{KERNELRELEASE}
+fi
+if [ -x /usr/bin/kernel-install ]; then
+	/usr/bin/kernel-install add %{KERNELRELEASE} /lib/modules/%{KERNELRELEASE}/vmlinuz
 fi
 
 %preun
