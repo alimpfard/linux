@@ -200,7 +200,10 @@ if [ -x /usr/bin/kernel-install ]; then
 fi
 
 %preun
-if [ -x /usr/bin/kernel-install ]; then
+# $1 is the number of instances left after this operation; only tear
+# down the boot entry when the package is actually being removed, not
+# when it is upgraded in place by a rebuild with the same KERNELRELEASE
+if [ "$1" -eq 0 ] && [ -x /usr/bin/kernel-install ]; then
 kernel-install remove %{KERNELRELEASE}
 fi
 
