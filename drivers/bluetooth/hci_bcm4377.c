@@ -649,6 +649,67 @@ static int bcm4377_extract_msgid(struct bcm4377_data *bcm4377,
 	return 0;
 }
 
+/*
+ * The firmware reports an ACL MTU that is larger than what fits into the
+ * buffers of acl_h2d_ring, and the core only fragments down to the reported
+ * MTU. Clamp it so that every outgoing ACL frame fits into a single buffer.
+ * This has to happen on the event itself since the core re-reads the buffer
+ * size on every power on.
+ */
+static void bcm4377_fixup_buffer_size(struct bcm4377_data *bcm4377,
+				      struct sk_buff *skb)
+{
+	size_t max_mtu =
+		bcm4377->acl_h2d_ring.mapped_payload_size - HCI_ACL_HDR_SIZE;
+	struct hci_event_hdr *hdr;
+	struct hci_ev_cmd_complete *cc;
+	__le16 *mtu;
+	u16 opcode;
+	size_t rp_len;
+
+	if (skb->len < sizeof(*hdr) + sizeof(*cc) + 1)
+		return;
+
+	hdr = (struct hci_event_hdr *)skb->data;
+	if (hdr->evt != HCI_EV_CMD_COMPLETE)
+		return;
+
+	cc = (struct hci_ev_cmd_complete *)(skb->data + sizeof(*hdr));
+	opcode = __le16_to_cpu(cc->opcode);
+	rp_len = skb->len - sizeof(*hdr) - sizeof(*cc);
+
+	switch (opcode) {
+	case HCI_OP_READ_BUFFER_SIZE: {
+		struct hci_rp_read_buffer_size *rp = (void *)(cc + 1);
+
+		if (rp_len < sizeof(*rp) || rp->status)
+			return;
+		mtu = &rp->acl_mtu;
+		break;
+	}
+	case HCI_OP_LE_READ_BUFFER_SIZE:
+	case HCI_OP_LE_READ_BUFFER_SIZE_V2: {
+		/* v2 shares the leading status/ACL MTU layout */
+		struct hci_rp_le_read_buffer_size *rp = (void *)(cc + 1);
+
+		if (rp_len < sizeof(*rp) || rp->status)
+			return;
+		mtu = &rp->le_mtu;
+		break;
+	}
+	default:
+		return;
+	}
+
+	if (__le16_to_cpu(*mtu) <= max_mtu)
+		return;
+
+	dev_info_once(&bcm4377->pdev->dev,
+		      "clamping ACL MTU reported by opcode 0x%04x from %u to %zu\n",
+		      opcode, __le16_to_cpu(*mtu), max_mtu);
+	*mtu = cpu_to_le16(max_mtu);
+}
+
 static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 				 struct bcm4377_transfer_ring *ring,
 				 u16 raw_msgid, u8 entry_flags, u8 type,
@@ -689,6 +750,8 @@ static void bcm4377_handle_event(struct bcm4377_data *bcm4377,
 
 	memcpy(skb_put(skb, len), payload, len);
 	hci_skb_pkt_type(skb) = type;
+	if (type == HCI_EVENT_PKT)
+		bcm4377_fixup_buffer_size(bcm4377, skb);
 	hci_recv_frame(bcm4377->hdev, skb);
 
 out:
