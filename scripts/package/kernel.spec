@@ -118,6 +118,16 @@ cp System.map %{buildroot}/lib/modules/%{KERNELRELEASE}
 cp .config %{buildroot}/lib/modules/%{KERNELRELEASE}/config
 if %{make} %{makeflags} run-command KBUILD_RUN_COMMAND='test -d ${srctree}/arch/${SRCARCH}/boot/dts' 2>/dev/null; then
 	%{make} %{makeflags} INSTALL_DTBS_PATH=%{buildroot}/lib/modules/%{KERNELRELEASE}/dtb dtbs_install
+	# Only keep the vendor directories listed in RPM_DTB_DIRS, if set
+	dtb_dirs="%{?dtb_dirs}"
+	if [ -n "${dtb_dirs}" ]; then
+		for d in %{buildroot}/lib/modules/%{KERNELRELEASE}/dtb/*; do
+			case " ${dtb_dirs} " in
+			*" ${d##*/} "*) ;;
+			*) rm -rf "${d}" ;;
+			esac
+		done
+	fi
 fi
 ln -fns /usr/src/kernels/%{KERNELRELEASE} %{buildroot}/lib/modules/%{KERNELRELEASE}/build
 %if %{with_devel}
