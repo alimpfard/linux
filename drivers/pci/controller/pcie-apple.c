@@ -30,6 +30,7 @@
 #include <linux/msi.h>
 #include <linux/of_irq.h>
 #include <linux/pci-ecam.h>
+#include <linux/pci_hotplug.h>
 
 #include "pci-host-common.h"
 
@@ -196,6 +197,8 @@ struct apple_pcie {
 	u32			nvecs;
 };
 
+#define MAX_AUX_PERST 3
+
 struct apple_pcie_port {
 	raw_spinlock_t		lock;
 	struct apple_pcie	*pcie;
@@ -207,6 +210,17 @@ struct apple_pcie_port {
 	unsigned long		*sid_map;
 	int			sid_map_sz;
 	int			idx;
+	struct gpio_desc	*reset;
+	/* HACK: additional PERST# until pci-pwrctrl gains PERST# support */
+	struct gpio_desc	*aux_reset[MAX_AUX_PERST];
+	u32			num_aux_resets;
+	struct gpio_desc	*pwren;
+#ifdef CONFIG_HOTPLUG_PCI
+	struct hotplug_slot	slot;
+	struct pci_bus		*slot_bus;
+	struct mutex		slot_lock;
+	bool			slot_powered;
+#endif
 };
 
 static void rmw_set(u32 set, void __iomem *addr)
@@ -554,14 +568,59 @@ static u32 apple_pcie_rid2sid_write(struct apple_pcie_port *port,
 	return readl_relaxed(port_rid2sid_addr(port, idx));
 }
 
-static int apple_pcie_setup_link(struct apple_pcie *pcie,
-				 struct apple_pcie_port *port,
-				 struct device_node *np)
+static int apple_pcie_get_gpios(struct apple_pcie *pcie,
+				struct apple_pcie_port *port,
+				struct device_node *np)
 {
-#define MAX_AUX_PERST 3
-	struct gpio_desc *aux_reset[MAX_AUX_PERST] = { NULL };
-	u32 num_aux_resets = 0;
-	struct gpio_desc *reset, *pwren = NULL;
+	/*
+	 * Leave the pins as they are, the link might already have been
+	 * brought up by the bootloader.
+	 */
+	port->reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np),
+					    "reset", GPIOD_ASIS, "PERST#");
+	if (IS_ERR(port->reset))
+		return PTR_ERR(port->reset);
+
+	for (u32 idx = 0; idx < MAX_AUX_PERST; idx++) {
+		struct gpio_desc *gd;
+
+		gd = devm_fwnode_gpiod_get_index(pcie->dev, of_fwnode_handle(np),
+						 "reset", idx + 1, GPIOD_ASIS,
+						 "PERST#");
+		if (IS_ERR(gd)) {
+			if (PTR_ERR(gd) == -ENOENT)
+				break;
+			else
+				return PTR_ERR(gd);
+		}
+		port->aux_reset[port->num_aux_resets++] = gd;
+	}
+	dev_info(pcie->dev, "Using %u auxiliary PERST#\n", port->num_aux_resets);
+
+	port->pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np),
+					    "pwren", GPIOD_ASIS, "PWREN");
+	if (IS_ERR(port->pwren)) {
+		if (PTR_ERR(port->pwren) == -ENOENT)
+			port->pwren = NULL;
+		else
+			return PTR_ERR(port->pwren);
+	}
+
+	return 0;
+}
+
+static void apple_pcie_port_assert_perst(struct apple_pcie_port *port)
+{
+	rmw_clear(PORT_PERST_OFF, port->base + port->pcie->hw->port_perst);
+	gpiod_direction_output(port->reset, 1);
+	for (u32 idx = 0; idx < port->num_aux_resets; idx++)
+		gpiod_direction_output(port->aux_reset[idx], 1);
+}
+
+static int apple_pcie_port_power_up(struct apple_pcie_port *port,
+				    bool setup_refclk)
+{
+	struct apple_pcie *pcie = port->pcie;
 	u32 stat;
 	int ret;
 
@@ -571,64 +630,31 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	 * deasserting it without prior clock setup.
 	 * Observed on M1 Max/Ultra Mac Studios under m1n1's hypervisor.
 	 */
-	reset = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "reset",
-				      GPIOD_OUT_HIGH, "PERST#");
-	if (IS_ERR(reset))
-		return PTR_ERR(reset);
-	// HACK: use additional "reset-gpios" until pci-pwrctrl gains PERST# support.
-	for (u32 idx = 0; idx < MAX_AUX_PERST; idx++) {
-		aux_reset[idx] = devm_fwnode_gpiod_get_index(pcie->dev,
-							     of_fwnode_handle(np),
-							     "reset", idx + 1,
-							     GPIOD_OUT_HIGH,
-							     "PERST#");
-		if (IS_ERR(aux_reset[idx])) {
-			if (PTR_ERR(aux_reset[idx]) == -ENOENT)
-				break;
-			else
-				return PTR_ERR(aux_reset[idx]);
-		}
-		num_aux_resets++;
-	}
-	dev_info(pcie->dev, "Using %u auxiliary PERST#\n", num_aux_resets);
-
-	pwren = devm_fwnode_gpiod_get(pcie->dev, of_fwnode_handle(np), "pwren",
-					    GPIOD_ASIS, "PWREN");
-	if (IS_ERR(pwren)) {
-		if (PTR_ERR(pwren) == -ENOENT)
-			pwren = NULL;
-		else
-			return PTR_ERR(pwren);
-	}
-
-	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
-
-	/* Assert PERST# before setting up the clock */
-	gpiod_set_value_cansleep(reset, 1);
-	for (u32 idx = 0; idx < num_aux_resets; idx++)
-		gpiod_set_value_cansleep(aux_reset[idx], 1);
+	apple_pcie_port_assert_perst(port);
 
 	/* Power on the device if required */
-	gpiod_set_value_cansleep(pwren, 1);
+	gpiod_direction_output(port->pwren, 1);
 
-	ret = apple_pcie_setup_refclk(pcie, port);
-	if (ret < 0)
-		return ret;
+	if (setup_refclk) {
+		ret = apple_pcie_setup_refclk(pcie, port);
+		if (ret < 0)
+			return ret;
+	}
 
 	/*
 	 * The minimal Tperst-clk value is 100us (PCIe CEM r5.0, 2.9.2)
 	 * If powering up, the minimal Tpvperl is 100ms
 	 */
-	if (pwren)
+	if (port->pwren)
 		msleep(100);
 	else
 		usleep_range(100, 200);
 
 	/* Deassert PERST# */
 	rmw_set(PORT_PERST_OFF, port->base + pcie->hw->port_perst);
-	gpiod_set_value_cansleep(reset, 0);
-	for (u32 idx = 0; idx < num_aux_resets; idx++)
-		gpiod_set_value_cansleep(aux_reset[idx], 0);
+	gpiod_set_value_cansleep(port->reset, 0);
+	for (u32 idx = 0; idx < port->num_aux_resets; idx++)
+		gpiod_set_value_cansleep(port->aux_reset[idx], 0);
 
 	/* Wait for 100ms after PERST# deassertion (PCIe r5.0, 6.6.1) */
 	msleep(100);
@@ -636,11 +662,43 @@ static int apple_pcie_setup_link(struct apple_pcie *pcie,
 	ret = readl_relaxed_poll_timeout(port->base + PORT_STATUS, stat,
 					 stat & PORT_STATUS_READY, 100, 250000);
 	if (ret < 0) {
-		dev_err(pcie->dev, "port %pOF ready wait timeout\n", np);
+		dev_err(pcie->dev, "port %pOF ready wait timeout\n", port->np);
 		return ret;
 	}
 
 	return 0;
+}
+
+static int apple_pcie_setup_link(struct apple_pcie *pcie,
+				 struct apple_pcie_port *port)
+{
+	rmw_set(PORT_APPCLK_EN, port->base + PORT_APPCLK);
+
+	return apple_pcie_port_power_up(port, true);
+}
+
+static void apple_pcie_port_train_link(struct apple_pcie_port *port)
+{
+	struct apple_pcie *pcie = port->pcie;
+	unsigned long timeout, left;
+	u32 link_stat;
+
+	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
+	if (link_stat & PORT_LINKSTS_UP)
+		return;
+
+	reinit_completion(&pcie->event);
+
+	/* start link training */
+	writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
+
+	timeout = link_up_timeout * HZ / 1000;
+	left = wait_for_completion_timeout(&pcie->event, timeout);
+	if (!left)
+		dev_warn(pcie->dev, "%pOF link didn't come up\n", port->np);
+	else
+		dev_info(pcie->dev, "%pOF link up after %ldms\n", port->np,
+			 (timeout - left) * 1000 / HZ);
 }
 
 static int apple_pcie_setup_port(struct apple_pcie *pcie,
@@ -688,10 +746,14 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	else
 		port->phy = pcie->base + CORE_PHY_DEFAULT_BASE(port->idx);
 
+	ret = apple_pcie_get_gpios(pcie, port, np);
+	if (ret)
+		return ret;
+
 	/* link might be already brought up by u-boot, skip setup then */
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
-		ret = apple_pcie_setup_link(pcie, port, np);
+		ret = apple_pcie_setup_link(pcie, port);
 		if (ret)
 			return ret;
 	}
@@ -727,24 +789,138 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	ret = apple_pcie_port_register_irqs(port);
 	WARN_ON(ret);
 
-	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
-	if (!(link_stat & PORT_LINKSTS_UP)) {
-		unsigned long timeout, left;
-		/* start link training */
-		writel_relaxed(PORT_LTSSMCTL_START, port->base + PORT_LTSSMCTL);
-
-		timeout = link_up_timeout * HZ / 1000;
-		left = wait_for_completion_timeout(&pcie->event, timeout);
-		if (!left)
-			dev_warn(pcie->dev, "%pOF link didn't come up\n", np);
-		else
-			dev_info(pcie->dev, "%pOF link up after %ldms\n", np,
-				 (timeout - left) * 1000 / HZ);
-
-	}
+	apple_pcie_port_train_link(port);
 
 	return 0;
 }
+
+#ifdef CONFIG_HOTPLUG_PCI
+/*
+ * Expose each port as a hotplug slot so that a wedged device (looking at you,
+ * brcmfmac) can be power cycled from userspace without a reboot:
+ *
+ *   echo 0 > /sys/bus/pci/slots/<slot>/power
+ *   echo 1 > /sys/bus/pci/slots/<slot>/power
+ *
+ * Powering the slot off removes all devices behind the port, asserts PERST#
+ * and drops PWREN. Powering it back on runs the same sequence as the initial
+ * link setup and rescans the bus.
+ */
+static struct apple_pcie_port *to_apple_pcie_port(struct hotplug_slot *slot)
+{
+	return container_of(slot, struct apple_pcie_port, slot);
+}
+
+static void apple_pcie_port_power_down(struct apple_pcie_port *port)
+{
+	apple_pcie_port_assert_perst(port);
+	gpiod_direction_output(port->pwren, 0);
+
+	/* Give the device some time to actually lose power */
+	if (port->pwren)
+		msleep(500);
+}
+
+static int apple_pcie_slot_enable(struct hotplug_slot *slot)
+{
+	struct apple_pcie_port *port = to_apple_pcie_port(slot);
+	int ret;
+
+	guard(mutex)(&port->slot_lock);
+	if (port->slot_powered)
+		return 0;
+
+	ret = apple_pcie_port_power_up(port, false);
+	if (ret) {
+		apple_pcie_port_power_down(port);
+		return ret;
+	}
+	port->slot_powered = true;
+
+	apple_pcie_port_train_link(port);
+
+	pci_lock_rescan_remove();
+	pci_rescan_bus(port->slot_bus);
+	pci_unlock_rescan_remove();
+
+	return 0;
+}
+
+static int apple_pcie_slot_disable(struct hotplug_slot *slot)
+{
+	struct apple_pcie_port *port = to_apple_pcie_port(slot);
+	struct pci_dev *pdev, *tmp;
+
+	guard(mutex)(&port->slot_lock);
+	if (!port->slot_powered)
+		return 0;
+
+	pci_lock_rescan_remove();
+	list_for_each_entry_safe_reverse(pdev, tmp, &port->slot_bus->devices,
+					 bus_list)
+		pci_stop_and_remove_bus_device(pdev);
+	pci_unlock_rescan_remove();
+
+	apple_pcie_port_power_down(port);
+	port->slot_powered = false;
+
+	return 0;
+}
+
+static int apple_pcie_slot_get_power_status(struct hotplug_slot *slot,
+					    u8 *value)
+{
+	struct apple_pcie_port *port = to_apple_pcie_port(slot);
+
+	guard(mutex)(&port->slot_lock);
+	*value = port->slot_powered;
+
+	return 0;
+}
+
+static const struct hotplug_slot_ops apple_pcie_slot_ops = {
+	.enable_slot		= apple_pcie_slot_enable,
+	.disable_slot		= apple_pcie_slot_disable,
+	.get_power_status	= apple_pcie_slot_get_power_status,
+};
+
+static void apple_pcie_register_slots(struct apple_pcie *pcie,
+				      struct pci_host_bridge *bridge)
+{
+	struct apple_pcie_port *port;
+	char name[32];
+	int ret;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		struct pci_dev *root;
+
+		root = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
+		if (!root)
+			continue;
+
+		port->slot_bus = root->subordinate;
+		pci_dev_put(root);
+		if (!port->slot_bus)
+			continue;
+
+		mutex_init(&port->slot_lock);
+		port->slot_powered = true;
+		port->slot.ops = &apple_pcie_slot_ops;
+
+		snprintf(name, sizeof(name), "%s-%d", dev_name(pcie->dev),
+			 port->idx);
+		ret = pci_hp_register(&port->slot, port->slot_bus, 0, name);
+		if (ret)
+			dev_warn(pcie->dev, "%pOF: failed to register slot: %d\n",
+				 port->np, ret);
+	}
+}
+#else
+static void apple_pcie_register_slots(struct apple_pcie *pcie,
+				      struct pci_host_bridge *bridge)
+{
+}
+#endif
 
 static const struct msi_parent_ops apple_msi_parent_ops = {
 	.supported_flags	= (MSI_GENERIC_FLAGS_MASK	|
@@ -988,7 +1164,13 @@ static int apple_pcie_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
-	return pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	ret = pci_host_common_init(pdev, bridge, &apple_pcie_cfg_ecam_ops);
+	if (ret)
+		return ret;
+
+	apple_pcie_register_slots(pcie, bridge);
+
+	return 0;
 }
 
 static const struct of_device_id apple_pcie_of_match[] = {
