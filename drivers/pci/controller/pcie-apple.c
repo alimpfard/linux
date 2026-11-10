@@ -33,6 +33,7 @@
 #include <linux/pci_hotplug.h>
 
 #include "pci-host-common.h"
+#include "../pci.h"
 
 static int link_up_timeout = 500;
 module_param(link_up_timeout, int, 0644);
@@ -220,6 +221,10 @@ struct apple_pcie_port {
 	struct pci_bus		*slot_bus;
 	struct mutex		slot_lock;
 	bool			slot_powered;
+	/* Power the slot off across system suspend */
+	bool			off_in_suspend;
+	/* Powered off by us for suspend, power back on after resume */
+	bool			suspend_off;
 #endif
 };
 
@@ -780,6 +785,11 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 	if (ret)
 		return ret;
 
+#ifdef CONFIG_HOTPLUG_PCI
+	port->off_in_suspend = of_property_read_bool(np,
+						     "apple,power-off-in-suspend");
+#endif
+
 	/* link might be already brought up by u-boot, skip setup then */
 	link_stat = readl_relaxed(port->base + PORT_LINKSTS);
 	if (!(link_stat & PORT_LINKSTS_UP)) {
@@ -852,6 +862,27 @@ static void apple_pcie_port_power_down(struct apple_pcie_port *port)
 		msleep(500);
 }
 
+/*
+ * pci_rescan_bus(), except that the functions are added (and their drivers
+ * probed) highest function first. On the BCM4387 wifi/bt combo, brcmfmac
+ * starting on the chip while hci_bcm4377 is still resetting and booting
+ * the bt function leaves bt dead (and the other way around corrupts the
+ * wifi firmware download). Both drivers probe synchronously, so this has
+ * bt fully up before brcmfmac touches the chip.
+ */
+static void apple_pcie_slot_add_devices(struct pci_bus *bus)
+{
+	struct pci_dev *dev;
+
+	pci_scan_child_bus(bus);
+	pci_assign_unassigned_bus_resources(bus);
+
+	list_for_each_entry_reverse(dev, &bus->devices, bus_list) {
+		if (!pci_dev_is_added(dev))
+			pci_bus_add_device(dev);
+	}
+}
+
 static int apple_pcie_slot_enable(struct hotplug_slot *slot)
 {
 	struct apple_pcie_port *port = to_apple_pcie_port(slot);
@@ -872,7 +903,7 @@ static int apple_pcie_slot_enable(struct hotplug_slot *slot)
 	apple_pcie_port_clock_gating(port, true);
 
 	pci_lock_rescan_remove();
-	pci_rescan_bus(port->slot_bus);
+	apple_pcie_slot_add_devices(port->slot_bus);
 	pci_unlock_rescan_remove();
 
 	return 0;
@@ -955,11 +986,77 @@ static void apple_pcie_register_slots(struct apple_pcie *pcie,
 				 port->np, ret);
 	}
 }
+
+#ifdef CONFIG_PM_SLEEP
+/*
+ * Power slots marked apple,power-off-in-suspend off before suspend and back
+ * on after resume, by removing and re-probing their devices like a manual
+ * power cycle through the hotplug slot.
+ *
+ * This can't be done from a PM notifier: drivers like Bluetooth register
+ * PM notifiers of their own and unregister them on removal, which deadlocks
+ * on the notifier chain lock. ->prepare() runs before any of our children
+ * are prepared and ->complete() after they're all done, so removing and
+ * adding them there is fine; their probes are deferred until the end of
+ * resume and then run in the order the devices were added. Both run in
+ * process context with interrupts on, so pwren can be an SMC GPIO.
+ */
+static int apple_pcie_pm_prepare(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_port *port;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->off_in_suspend || !port->slot_bus)
+			continue;
+		/* Leave slots someone already powered off alone */
+		if (!READ_ONCE(port->slot_powered))
+			continue;
+
+		dev_info(dev, "%pOF: powering off for suspend\n", port->np);
+		apple_pcie_slot_disable(&port->slot);
+		port->suspend_off = true;
+	}
+
+	return 0;
+}
+
+static void apple_pcie_pm_complete(struct device *dev)
+{
+	struct pci_host_bridge *bridge = dev_get_drvdata(dev);
+	struct apple_pcie *pcie = pci_host_bridge_priv(bridge);
+	struct apple_pcie_port *port;
+	int ret;
+
+	list_for_each_entry(port, &pcie->ports, entry) {
+		if (!port->suspend_off)
+			continue;
+		port->suspend_off = false;
+
+		dev_info(dev, "%pOF: powering on after resume\n", port->np);
+		ret = apple_pcie_slot_enable(&port->slot);
+		if (ret)
+			dev_err(dev, "%pOF: power on after resume failed: %d\n",
+				port->np, ret);
+	}
+}
+
+static const struct dev_pm_ops apple_pcie_pm_ops = {
+	.prepare	= apple_pcie_pm_prepare,
+	.complete	= apple_pcie_pm_complete,
+};
+#define APPLE_PCIE_PM_OPS	(&apple_pcie_pm_ops)
+#else
+#define APPLE_PCIE_PM_OPS	NULL
+#endif
 #else
 static void apple_pcie_register_slots(struct apple_pcie *pcie,
 				      struct pci_host_bridge *bridge)
 {
 }
+
+#define APPLE_PCIE_PM_OPS	NULL
 #endif
 
 static const struct msi_parent_ops apple_msi_parent_ops = {
@@ -1226,6 +1323,7 @@ static struct platform_driver apple_pcie_driver = {
 		.name			= "pcie-apple",
 		.of_match_table		= apple_pcie_of_match,
 		.suppress_bind_attrs	= true,
+		.pm			= APPLE_PCIE_PM_OPS,
 	},
 };
 module_platform_driver(apple_pcie_driver);
