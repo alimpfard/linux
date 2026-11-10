@@ -609,9 +609,39 @@ static int apple_pcie_get_gpios(struct apple_pcie *pcie,
 	return 0;
 }
 
+static void apple_pcie_port_clock_gating(struct apple_pcie_port *port,
+					 bool enable)
+{
+	struct apple_pcie *pcie = port->pcie;
+
+	if (enable) {
+		if (pcie->hw->port_refclk)
+			rmw_clear(PORT_REFCLK_CGDIS,
+				  port->base + pcie->hw->port_refclk);
+		else
+			rmw_set(PHY_LANE_CFG_REFCLKCGEN,
+				port->phy + PHY_LANE_CFG);
+
+		rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	} else {
+		rmw_set(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+
+		if (pcie->hw->port_refclk)
+			rmw_set(PORT_REFCLK_CGDIS,
+				port->base + pcie->hw->port_refclk);
+		else
+			rmw_clear(PHY_LANE_CFG_REFCLKCGEN,
+				  port->phy + PHY_LANE_CFG);
+	}
+}
+
+/*
+ * Only the PERST# GPIOs. Clearing PORT_PERST_OFF once the port is up
+ * appears to reset the root port itself: its config space reads as
+ * all-ones afterwards and the link can't be brought back.
+ */
 static void apple_pcie_port_assert_perst(struct apple_pcie_port *port)
 {
-	rmw_clear(PORT_PERST_OFF, port->base + port->pcie->hw->port_perst);
 	gpiod_direction_output(port->reset, 1);
 	for (u32 idx = 0; idx < port->num_aux_resets; idx++)
 		gpiod_direction_output(port->aux_reset[idx], 1);
@@ -758,12 +788,7 @@ static int apple_pcie_setup_port(struct apple_pcie *pcie,
 			return ret;
 	}
 
-	if (pcie->hw->port_refclk)
-		rmw_clear(PORT_REFCLK_CGDIS, port->base + pcie->hw->port_refclk);
-	else
-		rmw_set(PHY_LANE_CFG_REFCLKCGEN, port->phy + PHY_LANE_CFG);
-
-	rmw_clear(PORT_APPCLK_CGDIS, port->base + PORT_APPCLK);
+	apple_pcie_port_clock_gating(port, true);
 
 	ret = apple_pcie_port_setup_irq(port);
 	if (ret)
@@ -813,6 +838,12 @@ static struct apple_pcie_port *to_apple_pcie_port(struct hotplug_slot *slot)
 
 static void apple_pcie_port_power_down(struct apple_pcie_port *port)
 {
+	/*
+	 * With the link down the port would gate its clocks, taking the
+	 * root port's config space with it. Keep them running while the
+	 * slot is off.
+	 */
+	apple_pcie_port_clock_gating(port, false);
 	apple_pcie_port_assert_perst(port);
 	gpiod_direction_output(port->pwren, 0);
 
@@ -838,6 +869,7 @@ static int apple_pcie_slot_enable(struct hotplug_slot *slot)
 	port->slot_powered = true;
 
 	apple_pcie_port_train_link(port);
+	apple_pcie_port_clock_gating(port, true);
 
 	pci_lock_rescan_remove();
 	pci_rescan_bus(port->slot_bus);
@@ -897,6 +929,14 @@ static void apple_pcie_register_slots(struct apple_pcie *pcie,
 		root = pci_get_slot(bridge->bus, PCI_DEVFN(port->idx, 0));
 		if (!root)
 			continue;
+
+		/*
+		 * Once the slot is powered off the root port has no children
+		 * left, and the PCI core would happily put it into D3 on
+		 * suspend. Nobody has validated D3 on these ports, so keep
+		 * them in D0.
+		 */
+		root->dev_flags |= PCI_DEV_FLAGS_NO_D3;
 
 		port->slot_bus = root->subordinate;
 		pci_dev_put(root);
