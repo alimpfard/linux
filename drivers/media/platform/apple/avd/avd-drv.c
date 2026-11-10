@@ -684,6 +684,16 @@ static const struct of_device_id avd_of_match[] = {
 
 MODULE_DEVICE_TABLE(of, avd_of_match);
 
+static void avd_free_empty_domain(void *data)
+{
+	iommu_domain_free(data);
+}
+
+static void avd_release_firmware(void *data)
+{
+	release_firmware(data);
+}
+
 static int avd_probe(struct platform_device *pdev)
 {
 	struct avd_dev *avd;
@@ -721,6 +731,12 @@ static int avd_probe(struct platform_device *pdev)
 		if (IS_ERR(avd->empty_domain)) {
 			avd->empty_domain = NULL;
 			dev_warn(avd->dev, "cannot alloc new empty domain");
+		} else {
+			ret = devm_add_action_or_reset(avd->dev,
+						       avd_free_empty_domain,
+						       avd->empty_domain);
+			if (ret)
+				return ret;
 		}
 	}
 
@@ -731,10 +747,14 @@ static int avd_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	ret = devm_add_action_or_reset(avd->dev, avd_release_firmware,
+				       (void *)avd->fw);
+	if (ret)
+		return ret;
+
 	if (avd->fw->size < (AVD_CONFIG_OFFSET + AVD_CONFIG_SIZE)) {
 		dev_err(avd->dev, "Firmware %s is too small, size: %zu bytes\n",
 			avd->variant->fw_name, avd->fw->size);
-		iommu_domain_free(avd->empty_domain);
 		return -EINVAL;
 	}
 
@@ -786,12 +806,7 @@ static void avd_remove(struct platform_device *pdev)
 {
 	struct avd_dev *avd = platform_get_drvdata(pdev);
 
-	release_firmware(avd->fw);
-
 	avd_v4l2_cleanup(avd);
-
-	if (avd->empty_domain)
-		iommu_domain_free(avd->empty_domain);
 
 	pm_runtime_disable(avd->dev);
 	pm_runtime_dont_use_autosuspend(avd->dev);
