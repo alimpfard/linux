@@ -99,6 +99,13 @@ patternProperties:
         description: Optional GPIO to power on the device
         maxItems: 1
 
+      apple,power-off-in-suspend:
+        type: boolean
+        description:
+          Power the device behind this port off (PERST# and pwren) across
+          system suspend and power it back up on resume, for devices that
+          don't reliably survive suspend while powered.
+
     required:
       - reset-gpios
       - interrupt-controller
